@@ -1,218 +1,40 @@
+# -*- coding: utf-8 -*-
 """
-####################################################################################################
-USAGE:
-    spark-submit --deploy-mode client usr/canne/personalproject/script.py data_date region beta_flag
-####################################################################################################
+Helper Functions for Snowflake Connectivity and
+other snowflake operations.
 """
 
-# import python modules
+import sys
+import os
+import re
+import pandas as pd
+import snowflake.connector
+import configparser
 import ast
 import json
-import configparser
 import logging
-import subprocess
-import sys
-import re
-from datetime import datetime, timedelta
-import boto3
+import datetime
+import numpy as np
 
-# import pyspark modules
-from pyspark import SparkConf, SparkContext
-from pyspark.sql import SQLContext
-from pyspark.sql.types import StructField, StructType, StringType
-import pyspark.sql.functions as F
-from py4j.java_gateway import java_import
+curr_timestamp = datetime.datetime.now().strftime("%Y%m%d_%I%M%S")
+logname = 'snowflake' + curr_timestamp + '.log'
+logger = logging.getLogger("snowflake")
+logger.setLevel(logging.INFO)
+fh = logging.FileHandler('/var/log/spark-logs/'+logname)
+fh.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s  %(levelname)s  %(message)s', datefmt='%Y-%m-%dT%H:%M:%S%z')
+fh.setFormatter(formatter)
+logger.addHandler(fh)
 
-import dml_config
-from  script2 import update_env_variable, unloadmain
-
-# Setup Spark Config
-CONF = SparkConf()
-CONF.setAppName('script')
-
-# Create SparkContext
-SC = SparkContext(conf=CONF)
-SC.addPyFile("usr/canne/personalproject/script.py")
-SC.addPyFile("usr/canne/personalproject/script.py")
-
-# Create Sql context
-SQLCONTEXT = SQLContext(SC)
-
-# HDFS filesystem config
-java_import(SC._jvm, 'org.apache.hadoop.fs.Path')
-FS = SC._jvm.org.apache.hadoop.fs.FileSystem.get(SC._jsc.hadoopConfiguration())
-
-
-def main(data_date, region, beta_flag):
+def update_env_variable():
     """
-    Main Functions
+    Update Environment Variable as per /etc/profile
     """
-    LOGGER.info("Running Script for data_date: %s", format(data_date))
+    with open(r'/etc/profile', 'r') as f:
+        profile = f.read()
 
-    # UPDATE THE ENVIRONMENT VARIABLES TO UPDATE PROXY SETTINGS
-    update_env_variable()
-
-    if beta_flag == 'true':
-        s3_config_file = '/etc/vault-aws-ec2/s3path_beta_config.ini'
-    else:
-        s3_config_file = '/etc/vault-aws-ec2/s3path_config.ini'
-
-    s3_path = config_parser(region, s3_config_file)
-    db_credentials = dbconfig_parser(region)
-
-    s3_bucket = s3_path['OUTPUT_BUCKET'].replace('s3:', '').replace('s3a:', '').replace('/', '')
-    s3_folder = s3_path['OUTPUT_PREFIX']
-    file_pattern_events = 'tblEvents_cln.dat'
-    file_pattern_ptnrpevents = 'tblptnrpEvents_cln.dat'
-    events_filename = get_recent_s3_file(file_pattern_events, s3_bucket, s3_folder, data_date)
-    ptnrpevents_filename = get_recent_s3_file(file_pattern_ptnrpevents, \
-                                              s3_bucket, s3_folder, data_date)
-
-    LOGGER.info("Reading tblEvents cln file into Pyspark rdd")
-    try:
-        rdd_events = read_file_from_s3(events_filename, dml_config.tblEvt_cln_config, '\x01')
-    except Exception as exception:
-        LOGGER.error("Following Error Occurred While reading tblEvents cln file: %s", \
-                     format(exception))
-        raise Exception("Following Error Occurred While reading tblEvents cln file: %s", \
-                        format(exception))
-    LOGGER.info("Reading tblptnrpEvents cln file into Pyspark rdd")
-    try:
-        rdd_ptnrpevents = read_file_from_s3(ptnrpevents_filename, \
-                                            dml_config.tblEvt_cln_config, '\x01')
-    except Exception as exception:
-        LOGGER.error("Following Error Occurred While reading tblptnrpEvents cln file: %s", \
-                     format(exception))
-        raise Exception("Following Error Occurred While reading tblptnrpEvents cln file: %s", \
-                        format(exception))
-
-    LOGGER.info("Creating dataframe from Events rdd")
-    try:
-        schema = StructType([
-            StructField("my_id", StringType(), True),
-            StructField("my_id2", StringType(), True)
-        ])
-        df_events = SQLCONTEXT.createDataFrame(rdd_events, schema)
-        x_events = df_events.select(F.max("my_id"), \
-                                    F.min("my_id")).collect()[0]
-        max_events = x_events["max(my_id)"]
-        min_events = x_events["min(my_id)"]
-    except Exception as exception:
-        LOGGER.error("Following Error Occurred While creating dataframe for Events {0}" \
-                     .format(exception))
-        raise Exception("Following Error Occurred While creating dataframe for Events {0}" \
-                        .format(exception))
-
-    if not max_events:
-        max_events = 0
-
-    if not min_events:
-        min_events = 0
-
-    LOGGER.info("Creating dataframe from ptnrpEvents rdd")
-    try:
-        df_ptnrpevents = SQLCONTEXT.createDataFrame(rdd_ptnrpevents, schema)
-        x_ptnrpevents = df_ptnrpevents.select(F.max("my_id"), \
-                                              F.min("my_id")).collect()[0]
-        max_ptnrpevents = x_ptnrpevents["max(my_id)"]
-        min_ptnrpevents = x_ptnrpevents["min(my_id)"]
-    except Exception as exception:
-        LOGGER.error("Following Error Occurred While creating dataframe for ptnrpEvents {0}" \
-                     .format(exception))
-        raise Exception("Following Error Occurred While creating dataframe for ptnrpEvents {0}" \
-                        .format(exception))
-
-    if not max_ptnrpevents:
-        max_ptnrpevents = 0
-
-    if not min_ptnrpevents:
-        min_ptnrpevents = 0
-
-    LOGGER.info("Creating dataframe from table")
-    try:
-        query = '''select
-                    emp_id,
-                    emp_age,
-                    from (
-                        select
-                        emp_id,
-                        emp_age,
-                        from emp_table
-                        where (my_id between ''' + str(min_events) + \
-                ' and ' + str(max_events) + ')' + \
-                'or (my_id between ' + str(min_ptnrpevents) + \
-                ' and ' + str(max_ptnrpevents) + ')' + \
-                ') where rank = 1'
-        # df_plstc_drv = runsfquery(db_credentials, query)
-        schema = StructType([StructField(field_name, StringType(), True) for field_name in ['emp_id', 'emp_age']])
-        df_plstc_drv = runsfquery(region, query, schema)
-    except Exception as exception:
-        LOGGER.error("Following Error Occurred While creating dataframe from Snowflake \
-        table pr_case_plstc {0}".format(exception))
-        raise Exception("Following Error Occurred While creating dataframe from Snowflake \
-        table pr_case_plstc {0}".format(exception))
-
-    LOGGER.info("Filtering out required emp_id")
-    df_unique_cases = df_events.union(df_ptnrpevents)
-    df_unique_cases = df_unique_cases.select('emp_id').drop_duplicates()
-    df_plstc_drv = df_plstc_drv.join(df_unique_cases, ['emp_id'], 'inner')
-
-    output_file_name = 'pr_case_plstc_drv.dat'
-    LOGGER.info("Total records = {0}".format(df_plstc_drv.count()))
-    write_dataframe_to_hdfs(df_plstc_drv, output_file_name, '\x01')
-    upload_files_to_s3(data_date, s3_path, [output_file_name])
-
-
-def runsfquery_spark(db_credentials, query):
-    """
-    Execute query in Snowflake database
-    """
-    LOGGER.info("Executing query in Snowflake")
-    try:
-        data_frame = SQLCONTEXT.read.format("net.snowflake.spark.snowflake") \
-            .option("sfURL", db_credentials['HOST']) \
-            .option("sfUser", db_credentials['USER']) \
-            .option("sfPassword", db_credentials['PASSWORD']) \
-            .option("sfDatabase", db_credentials['DATABASE']) \
-            .option("sfSchema", db_credentials['SCHEMA']) \
-            .option("sfWarehouse", db_credentials['WAREHOUSE']) \
-            .option("query", query) \
-            .load()
-    except Exception as exception:
-        LOGGER.error("Following error occurred while running the snowflake query: {0}:{1}". \
-                        format(query, exception))
-        raise Exception("Following error occurred while running the snowflake query: {0}:{1}". \
-                        format(query, exception))
-    return data_frame
-
-
-def runsfquery(region, query, schema):
-    """
-    Execute query in Snowflake database
-    """
-    LOGGER.info("Executing query in Snowflake")
-    try:
-        data_frame = unloadmain(region, query)
-    except Exception as exception:
-        LOGGER.error("Following error occurred while running the snowflake query: ". \
-                        format(query, exception))
-        raise Exception("Following error occurred while running the snowflake query: ". \
-                        format(query, exception))
-    spark_df = SQLCONTEXT.createDataFrame(data_frame, schema)
-    return spark_df
-
-
-def config_parser(region, s3_config_file):
-    """
-    Config parser reading INI file for S3 Paths
-    """
-    config = configparser.RawConfigParser()
-    config.read(s3_config_file)
-    region = region.lower()
-    s3_path = dict((k.upper(), v) for k, v in config.items(region))
-    s3_path = ast.literal_eval(json.dumps(s3_path))
-    return s3_path
-
+    pattern = re.compile(r'^export\s*(.*)\s*=\s*(.*)', re.MULTILINE)
+    os.environ.update(dict(pattern.findall(profile)))
 
 def dbconfig_parser(region):
     """
@@ -226,158 +48,115 @@ def dbconfig_parser(region):
     return db_credentials
 
 
-def output_paths(s3_path, data_date):
+def get_snowflake_connection(region, db_credentials):
+    """authenticate to snowflake and deliver a connection object"""
+    # get connection
+    ctx = snowflake.connector.connect(
+        user=db_credentials['USER'],
+        password=db_credentials['PASSWORD'],
+        account=db_credentials['HOST'],
+        warehouse=db_credentials['WAREHOUSE']
+    )
+    return ctx
+
+def get_snowflake_cursor(region, db_credentials):
+    """deliver a cursor for executing queries"""
+    ctx = get_snowflake_connection(region, db_credentials)
+    cs = ctx.cursor()
+    return cs
+
+def create_sf_table(region, data, tbl_nm=''):
     """
-    Creating output path and filenames
+    Create table in Snowflake for given data.
+
+    Args:
+        region: AWS region
+        data: [Pandas Dataframe | Columns (List/ Tuple) | Query (String) ].
+        If Pandas Dataframe, the DDL information will be extracted from to
+        create the table.
+        tbl_nm: The Table name (database and schema included is preferred)
     """
-    LOGGER.info("Setting Up Output  File and path names")
-    output_s3_path_prefix = s3_path['OUTPUT_BUCKET'] + s3_path['OUTPUT_PREFIX']
-    output_folder_name = (datetime.strptime(data_date, '%Y%m%d') + timedelta(1)) \
-        .strftime('%Y_%m_%d_')
-    output_file_name_prefix = data_date + datetime.now().strftime('_%Y%m%d%H%m%S_')
-    return output_s3_path_prefix, output_folder_name, output_file_name_prefix
+    # GET SNOWFLAKE CURSOR
+    db_credentials = dbconfig_parser(region)
+    sf_cur = get_snowflake_cursor(region, db_credentials)
+
+    if isinstance(data, pd.DataFrame):
+     # EXTRACT DDL INFORMATION FROM PANDAS
+        pd_df = data
+
+        if 'newline' in pd_df.columns:
+            pd_df = pd_df.drop('newline', axis=1)
+
+        pd_sf_dtype_map = {'object':'VARCHAR', 'int64':'NUMBER', 'float64':'DECIMAL', 'datetime64':'DATETIME', 'bool':'BOOLEAN'}
+        dtype_pattern = re.compile(r'\s+(.*)')
+        dtype_str = str(pd_df.dtypes)
+        dtype_list = dtype_str.split('\n')
+        sf_dtype = list(map(lambda x: pd_sf_dtype_map[dtype_pattern.findall(x)[0]], dtype_list))
+        columns = tuple(map(lambda x: ' '.join(x), zip(pd_df.columns, sf_dtype)))
+
+        query = '''CREATE TABLE IF NOT EXISTS {0} ({1})'''.format(tbl_nm, ','.join(columns))
+
+    elif isinstance(data, (list, tuple)):
+        columns = data
+
+        query = '''CREATE TABLE IF NOT EXISTS {0} ({1})'''.format(tbl_nm, ','.join(columns))
+
+    elif isinstance(data, str):
+        query = data
+
+    else:
+        print('INVALID DATA TYPE {0} PROVIDED TO CREATE THE TABLE.'.format(type(data)))
+        raise Exception()
+
+    # RUN QUERY
+    sf_cur.execute(query)
+    print('Table Created Successfully.')
 
 
-def write_dataframe_to_hdfs(data_frame, output_file_name, seperator):
-    """
-    Writing DaaFrame to HDFS and Renaming
-    """
-    LOGGER.info("Saving DataFrame to HDFS: %s", output_file_name)
-    save_as_file_name = datetime.now().strftime("%Y%m%d%H%M%S_") + output_file_name
-    data_frame.repartition(1) \
-        .write.format("csv") \
-        .mode('overwrite') \
-        .option("sep", seperator) \
-        .option('nullValue', None) \
-        .option("header", "false") \
-        .option("quote", '') \
-        .save(save_as_file_name)
-    current_file_name = 'hdfs:///user/hadoop/' + save_as_file_name
-    new_file_name = 'hdfs:///user/hadoop/' + output_file_name
+def select_table(user, table, cursor):
+    """select and return a specificied user table"""
+    sql = '''SELECT * from SB.user_{user}.{table}'''
+    cursor.execute(sql)
+    return cursor.fetchall()
+
+def get_table_as_df(user, table, cursor):
+    """deliver a pandas dataframe of a selected user table"""
+    t_data = select_table(user, table, cursor)
+    t_columns = cursor._column_idx_to_name.values()
+    df = pd.DataFrame(t_data, columns=t_columns)
+    return df
+
+def get_query_as_df(sql, cursor):
+    """deliver a pandas dataframe for a given query
+    Example input:
+    sql = "SELECT * FROM db.pcdw.t2_evt WHERE evt_Dt = '2017-12-31' LIMIT 2" """
+    cursor.execute(sql)
+    t_data = cursor.fetchall()
+    t_columns = cursor._column_idx_to_name.values()
+    df = pd.DataFrame(t_data, columns=t_columns)
+    for col in df.columns:
+        if (df[col].dtypes != np.int64) & (df[col].dtypes != np.float64):
+            df[col] = df[col].fillna('')
+    return df
+
+def unloadmain(region, query):
     try:
-        file = FS.globStatus(SC._jvm.Path(current_file_name + '/part*'))[0].getPath().getName()
-    except Exception as exception:
-        LOGGER.error("Following Error Occurred While renaming file: %s", exception)
-        raise Exception("Following Error Occurred While renaming file: %s", exception)
-    FS.rename(SC._jvm.Path(current_file_name + '/' + file), SC._jvm.Path(new_file_name))
-    FS.delete(SC._jvm.Path(save_as_file_name), True)
-
-
-def bash_cmd(args_list):
-    """
-    Function to run bash commands
-    """
-    proc = subprocess.Popen(args_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    proc_output, proc_stat_code = proc.communicate()
-    proc_status = proc.returncode
-    if proc_status != 0:
-        raise Exception("Following Error Occured in Subprocess cmd: %s", proc_stat_code)
+        db_credentials = dbconfig_parser(region)
+        logger.info('Extract Database connection details')
+    except Exception as err:
+        logger.error('Extract Database connection details failed: %s', err)
+        exit(2)
     else:
-        return proc_output
-
-
-def upload_files_to_s3(data_date, s3_path, list_of_files, filetype=False):
-    """
-    Uploading the files to S3
-    """
-    LOGGER.info("Pulling Existing Files with same Suffix")
-    output_s3_path_prefix = s3_path['OUTPUT_BUCKET'] + s3_path['OUTPUT_PREFIX']
-    output_folder_date = (datetime.strptime(data_date, '%Y%m%d') + \
-                          timedelta(1)).strftime('%Y_%m_%d_/')
-    if filetype:
-        output_s3_path_prefix = output_s3_path_prefix + '/' + output_folder_date + filetype + '/'
-    else:
-        output_s3_path_prefix = output_s3_path_prefix + '/' + output_folder_date
-    for output_file_name in list_of_files:
-        filename_pattern_extn = re.compile(r'_([^\d].*)')
-        output_file_suffix = filename_pattern_extn.findall(output_file_name)[0]
-        LOGGER.info("Deleting Existing File for %s", output_file_name)
-        args_list = ['aws', 's3', 'rm', output_s3_path_prefix, '--recursive', '--exclude', \
-                     '*', '--include', '*{}*'.format(output_file_suffix)]
-        bash_cmd(args_list)
-        LOGGER.info("Uploading %s file to S3", output_file_name)
-        s3_file_path = output_s3_path_prefix + output_file_name
-        output_file_hdfs_path = 'hdfs:///user/hadoop/' + output_file_name
-        args_list = ['hadoop', 'fs', '-get', '-f', output_file_hdfs_path]
-        bash_cmd(args_list)
-        args_list = ['aws', 's3', 'cp', output_file_name, s3_file_path, '--sse']
-        bash_cmd(args_list)
-
-
-def read_file_from_s3(input_file_path, reader_config, seperator):
-    """
-    Custom Reader for Files with Multiline characters in between records
-    """
-    _rdd = SC.newAPIHadoopFile(input_file_path,
-                               'com.capitalone.adfinem.reader.CustomFileFormat',
-                               'org.apache.hadoop.io.LongWritable',
-                               'org.apache.hadoop.io.Text', conf=reader_config)
-    _rdd = _rdd.map(lambda line: line[1].split(seperator)[0:11])
-    return _rdd
-
-
-def get_recent_s3_file(file_pattern, s3_bucket, s3_folder, data_date):
-    """
-    Get latest file from s3 path:
-    Usage: file_pattern - The pattern of the file including the file extension. e.g. 'Account.dat'
-           s3_bucket    - s3 bucket name. e.g. 'card-datapipeline-ignite'
-           s3_folder    - The complete s3 path excluding the date folder
-           data_date    - The data date to look for in the s3 folder. format YYYYMMDD
-    """
-    s3_client = boto3.client('s3')
-    data_date = (datetime.strptime(data_date, '%Y%m%d') + timedelta(1)).strftime('%Y_%m_%d_')
-    if s3_client.list_objects_v2(Bucket=s3_bucket, Prefix=s3_folder + '/' + \
-                                                          data_date)['KeyCount'] > 0:
-        objs = s3_client.list_objects_v2(Bucket=s3_bucket, Prefix=s3_folder + '/' + data_date) \
-            ['Contents']
-        objs = [x for x in objs if x['Key'][-len(file_pattern):] == file_pattern]
-    else:
-        raise Exception("{0} folder is not present in the s3 path: s3://{1}/{2}" \
-                        .format(data_date, s3_bucket, s3_folder))
+        logger.info('Start database session')
     try:
-        filename = [obj['Key'] for obj in sorted(objs, key=lambda obj: int(obj['LastModified'] \
-                                                                           .strftime('%s')))][0]
-        LOGGER.info("file name =" + filename)
-    except Exception as exception:
-        if not objs:
-            raise Exception("{0} File is not present in the s3 bucket path: s3://{1}/{2}/{3}" \
-                            .format(file_pattern, s3_bucket, s3_folder, data_date))
-        else:
-            raise Exception("Following error occured while getting latest clean file from s3: {0}" \
-                            .format(exception))
-    return 's3://' + s3_bucket + '/' + filename
-
-
-if __name__ == '__main__':
-    start_time = datetime.now()
-
-    arguments = sys.argv
-
-    if (datetime.strptime(arguments[1], '%Y%m%d')) and (arguments[2].lower() in ['east', 'west']) and (arguments[3].lower() in ['true', 'false']):
-        data_date = arguments[1]
-        region = arguments[2].lower()
-        beta_flag = arguments[3].lower()
-        # Set Logger
-        logging.basicConfig(level=logging.INFO, \
-                            format='%(asctime)s %(levelname)-8s %(message)s', \
-                            datefmt='%Y-%m-%dT%H:%M:%S%z', \
-                            filename='/var/log/spark-logs/' + \
-                                     data_date + \
-                                     '_dist_plstc_drv.log', filemode='w')
-        console = logging.StreamHandler()
-        console.setLevel(logging.INFO)
-        LOGGER = logging.getLogger('')
-
-        LOGGER.info('Current Run:spark-submit --deploy-mode cluster'
-                    '--py-files dml_config.py,sql_queries.py'
-                    'script.py {0} {1} {2}'.format(data_date, region, beta_flag))
-
-        LOGGER.info(">>>>>>>>>>>>>>>>>>>>>>>Start {0}:{1}".format( \
-            __name__, str(start_time)))
-        main(data_date, region, beta_flag)
+        unload_data = get_query_as_df(query, get_snowflake_cursor(region, db_credentials))
+        logger.info('Data Unload : %s', query)
+    except Exception as e:
+        logger.error('Database unload failed: %s', e)
+        exit(3)
     else:
-        raise Exception("Arguments are not in Required format: Data_date :['YYYYMMDD'], Region:['east'/'west'], Beta:['true'/'false']")
+        logger.info('Database unload finished successfully for : %s', query)
 
-    end_time = datetime.now()
-    LOGGER.info("<<<<<<<<<<<<<<<<<<<<<<<<<<<Completed{0}. Execution Time: {1}".format( \
-        __name__, str(end_time - start_time)))
+    fh.flush()
+    fh.close()
+    return unload_data
